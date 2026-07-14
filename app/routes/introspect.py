@@ -35,6 +35,10 @@ class IntrospectResponse(BaseModel):
     tenant_id: str
     tenant_name: str | None
     entitlements: list[str]
+    # True when the caller is a super-admin currently viewing a tenant
+    # that isn't their home tenant. Product backends use this to enforce
+    # read-only semantics on non-whitelisted write routes.
+    viewing_other_tenant: bool = False
     # For product backends that want to render a debug string
     session_source: str = "cookie"
 
@@ -58,6 +62,7 @@ def introspect(
     # Honor super-admin switch-mode — the product backend sees the tenant
     # the super-admin is viewing, not their home tenant.
     effective_tenant_id = user.tenant_id
+    viewing_other = False
     if user.is_super_admin:
         viewing = request.session.get("viewing_tenant_id")
         if viewing:
@@ -69,6 +74,7 @@ def introspect(
                 viewing_uuid = None
             if viewing_uuid is not None and db.get(Tenant, viewing_uuid) is not None:
                 effective_tenant_id = viewing_uuid
+                viewing_other = viewing_uuid != user.tenant_id
 
     tenant = db.get(Tenant, effective_tenant_id)
 
@@ -81,4 +87,5 @@ def introspect(
         tenant_id=str(effective_tenant_id),
         tenant_name=tenant.name if tenant else None,
         entitlements=_entitlements_for_tenant(db, effective_tenant_id),
+        viewing_other_tenant=viewing_other,
     )
