@@ -92,12 +92,14 @@ def _insert_many(
     columns: list[str],
     rows: list[dict[str, Any]],
     *,
-    dry_run: bool,
     conflict_target: str = "id",
 ) -> int:
     """Bulk-insert rows into ``table`` with ON CONFLICT DO NOTHING on the
-    given target. Returns the number of rows that would be / were actually
-    inserted (excludes conflicts). In dry-run, no commit."""
+    given target. Returns the number of rows that were inserted (excludes
+    conflicts). Does NOT commit — the caller owns the outer transaction,
+    so dry-run vs commit is decided at the very end after all tables have
+    been inserted (necessary because table N's FKs may reference table N-1).
+    """
     if not rows:
         return 0
     cols_sql = ", ".join(columns)
@@ -112,14 +114,10 @@ def _insert_many(
             values = [row.get(c) for c in columns]
             cur.execute(sql, values)
             inserted += cur.rowcount
-    if not dry_run:
-        conn.commit()
-    else:
-        conn.rollback()
     return inserted
 
 
-def migrate_tenants(src: psycopg.Connection, tgt: psycopg.Connection, dry_run: bool) -> int:
+def migrate_tenants(src: psycopg.Connection, tgt: psycopg.Connection) -> int:
     rows = _fetch_all(
         src,
         "SELECT id, name, segment, created_at, system_context FROM tenants ORDER BY created_at",
@@ -129,11 +127,10 @@ def migrate_tenants(src: psycopg.Connection, tgt: psycopg.Connection, dry_run: b
         "tenants",
         ["id", "name", "segment", "created_at", "system_context"],
         rows,
-        dry_run=dry_run,
     )
 
 
-def migrate_users(src: psycopg.Connection, tgt: psycopg.Connection, dry_run: bool) -> int:
+def migrate_users(src: psycopg.Connection, tgt: psycopg.Connection) -> int:
     rows = _fetch_all(
         src,
         """
@@ -157,17 +154,12 @@ def migrate_users(src: psycopg.Connection, tgt: psycopg.Connection, dry_run: boo
             "created_at",
         ],
         rows,
-        dry_run=dry_run,
     )
 
 
-def migrate_auth_tokens(
-    src: psycopg.Connection, tgt: psycopg.Connection, dry_run: bool
-) -> int:
-    """Only carry over tokens that could still be valid — used or
-    expired tokens are dead weight in the identity DB. A 'valid' token
-    here means used_at is NULL and expires_at is in the future."""
-    now = datetime.now(timezone.utc)
+def migrate_auth_tokens(src: psycopg.Connection, tgt: psycopg.Connection) -> int:
+    """Only carry over tokens that could still be valid — used or expired
+    tokens are dead weight in the identity DB."""
     rows = _fetch_all(
         src,
         """
@@ -176,25 +168,18 @@ def migrate_auth_tokens(
         WHERE used_at IS NULL AND expires_at > NOW()
         """,
     )
-    # `now` unused directly — kept in signature so a caller can extend the
-    # window later without a schema change. Keep the variable to avoid a
-    # lint warning without silencing linters project-wide.
-    _ = now
     return _insert_many(
         tgt,
         "auth_tokens",
         ["id", "user_id", "token_hash", "purpose", "expires_at", "used_at", "created_at"],
         rows,
-        dry_run=dry_run,
     )
 
 
-def seed_default_subscriptions(tgt: psycopg.Connection, dry_run: bool) -> int:
+def seed_default_subscriptions(tgt: psycopg.Connection) -> int:
     """For every tenant that doesn't already have a `takanon` subscription
     row, insert one (active, no expiry). Idempotent — safe to re-run."""
     with tgt.cursor() as cur:
-        # Not adding a unique index in this script — we simply check
-        # existence per-row. Cheap for the small tenant counts we have.
         cur.execute(
             """
             SELECT t.id
@@ -217,11 +202,6 @@ def seed_default_subscriptions(tgt: psycopg.Connection, dry_run: bool) -> int:
                 (tenant_id, DEFAULT_PRODUCT),
             )
             inserted += 1
-
-    if not dry_run:
-        tgt.commit()
-    else:
-        tgt.rollback()
     return inserted
 
 
@@ -286,25 +266,32 @@ def main() -> int:
             )
             return 1
 
-        t = migrate_tenants(src, tgt, dry_run)
-        print(f"\n→ tenants: inserted {t}")
-        u = migrate_users(src, tgt, dry_run)
-        print(f"→ users: inserted {u}")
-        a = migrate_auth_tokens(src, tgt, dry_run)
-        print(f"→ auth_tokens (valid only): inserted {a}")
-        s = seed_default_subscriptions(tgt, dry_run)
-        print(f"→ subscriptions (default '{DEFAULT_PRODUCT}'): inserted {s}")
+        # All inserts happen inside one long-lived transaction on the target
+        # so FKs across tables resolve. We commit or rollback ONCE at the
+        # end depending on --dry-run vs --commit. If any insert raises,
+        # `with _open(...)` will roll back automatically.
+        t = migrate_tenants(src, tgt)
+        print(f"\n→ tenants: staged {t}")
+        u = migrate_users(src, tgt)
+        print(f"→ users: staged {u}")
+        a = migrate_auth_tokens(src, tgt)
+        print(f"→ auth_tokens (valid only): staged {a}")
+        s = seed_default_subscriptions(tgt)
+        print(f"→ subscriptions (default '{DEFAULT_PRODUCT}'): staged {s}")
 
         _print_counts(
-            "Target (identity) after:",
+            "Target (identity) after (in-txn):",
             tgt,
             ["tenants", "users", "auth_tokens", "subscriptions"],
         )
 
-    if dry_run:
-        print("\nDRY-RUN complete. Re-run with --commit to actually migrate.")
-    else:
-        print("\nMigration committed.")
+        if dry_run:
+            tgt.rollback()
+            print("\nDRY-RUN complete — rolled back. Re-run with --commit to actually migrate.")
+        else:
+            tgt.commit()
+            print("\nMigration committed.")
+
     return 0
 
 
