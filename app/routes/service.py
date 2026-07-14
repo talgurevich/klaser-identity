@@ -6,12 +6,18 @@ are configured via the `SERVICE_TOKENS` env var (comma-separated); each
 product backend gets its own so revocation is granular.
 
 What's here:
-- `POST /api/service/users` — a product backend can create (invite) a
-  user in a tenant. Issues a registration token and emails the invite.
-- `GET /api/service/users/{id}` — look up a user by ID.
-- `GET /api/service/tenants/{id}` — look up a tenant by ID.
-- `GET /api/service/tenants/{id}/subscriptions` — list a tenant's product
-  entitlements (active + inactive).
+- Users
+  - `POST /api/service/users` — invite (creates user + emails token).
+  - `GET  /api/service/users` — list, optional `tenant_id` filter.
+  - `GET  /api/service/users/{id}` — lookup.
+  - `PATCH /api/service/users/{id}` — update role/name/tenant/super-admin.
+  - `DELETE /api/service/users/{id}` — hard-delete.
+  - `POST /api/service/users/{id}/resend-invite` — new token + email.
+- Tenants
+  - `POST /api/service/tenants` — create (auto-seeds `takanon` sub).
+  - `GET  /api/service/tenants` — list.
+  - `GET  /api/service/tenants/{id}` — lookup.
+  - `GET  /api/service/tenants/{id}/subscriptions` — list entitlements.
 """
 from __future__ import annotations
 
@@ -135,6 +141,153 @@ def get_user(user_id: str, db: Session = Depends(get_db)) -> ServiceUserOut:
     )
 
 
+@router.get("/users", response_model=list[ServiceUserOut])
+def list_users(
+    tenant_id: str | None = None,
+    db: Session = Depends(get_db),
+) -> list[ServiceUserOut]:
+    """List every user. Optional `tenant_id` filter. Ordered by email
+    for stable pagination if we ever need it — small dataset today."""
+    q = db.query(User)
+    if tenant_id:
+        try:
+            tid = UUID(tenant_id)
+        except (ValueError, TypeError) as e:
+            raise HTTPException(400, "Invalid tenant_id") from e
+        q = q.filter(User.tenant_id == tid)
+    rows = q.order_by(User.email).all()
+    return [
+        ServiceUserOut(
+            id=str(u.id),
+            email=u.email,
+            display_name=u.display_name,
+            role=u.role,
+            is_super_admin=u.is_super_admin,
+            tenant_id=str(u.tenant_id),
+        )
+        for u in rows
+    ]
+
+
+class UpdateUserRequest(BaseModel):
+    role: str | None = None
+    display_name: str | None = None
+    tenant_id: str | None = None
+    is_super_admin: bool | None = None
+
+
+@router.patch("/users/{user_id}", response_model=ServiceUserOut)
+def update_user(
+    user_id: str,
+    payload: UpdateUserRequest,
+    db: Session = Depends(get_db),
+) -> ServiceUserOut:
+    """Update mutable fields on a user. Fields absent from the payload
+    are left untouched (`display_name` set to empty string is treated as
+    explicit clear, not "leave alone")."""
+    try:
+        uid = UUID(user_id)
+    except (ValueError, TypeError) as e:
+        raise HTTPException(400, "Invalid user_id") from e
+    user = db.get(User, uid)
+    if user is None:
+        raise HTTPException(404, "User not found")
+
+    if payload.role is not None:
+        user.role = payload.role
+    if payload.display_name is not None:
+        user.display_name = payload.display_name or None
+    if payload.tenant_id is not None:
+        try:
+            new_tid = UUID(payload.tenant_id)
+        except (ValueError, TypeError) as e:
+            raise HTTPException(400, "Invalid tenant_id") from e
+        if db.get(Tenant, new_tid) is None:
+            raise HTTPException(404, "Tenant not found")
+        user.tenant_id = new_tid
+    if payload.is_super_admin is not None:
+        user.is_super_admin = payload.is_super_admin
+
+    db.commit()
+    db.refresh(user)
+    log.info("service.user_updated", user_id=str(user.id))
+    return ServiceUserOut(
+        id=str(user.id),
+        email=user.email,
+        display_name=user.display_name,
+        role=user.role,
+        is_super_admin=user.is_super_admin,
+        tenant_id=str(user.tenant_id),
+    )
+
+
+@router.delete("/users/{user_id}")
+def delete_user(user_id: str, db: Session = Depends(get_db)) -> dict:
+    """Hard-delete a user. Cascades to auth_tokens via the FK's
+    ON DELETE CASCADE. Callers are responsible for guarding against
+    self-deletion — the caller here has no session context."""
+    try:
+        uid = UUID(user_id)
+    except (ValueError, TypeError) as e:
+        raise HTTPException(400, "Invalid user_id") from e
+    user = db.get(User, uid)
+    if user is None:
+        raise HTTPException(404, "User not found")
+    db.delete(user)
+    db.commit()
+    log.info("service.user_deleted", user_id=user_id)
+    return {"status": "ok"}
+
+
+class ResendInviteResponse(BaseModel):
+    status: str
+    email: str
+
+
+@router.post("/users/{user_id}/resend-invite", response_model=ResendInviteResponse)
+def resend_invite(
+    user_id: str,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+) -> ResendInviteResponse:
+    """Re-issue a registration token for a user who hasn't set a
+    password yet, and email a fresh invite. Refuses once the user
+    already has a password — use forgot-password for that case."""
+    try:
+        uid = UUID(user_id)
+    except (ValueError, TypeError) as e:
+        raise HTTPException(400, "Invalid user_id") from e
+    user = db.get(User, uid)
+    if user is None:
+        raise HTTPException(404, "User not found")
+    if user.password_hash is not None:
+        raise HTTPException(
+            409, "המשתמש כבר הגדיר סיסמה — יש להשתמש באיפוס סיסמה במקום."
+        )
+    tenant = db.get(Tenant, user.tenant_id)
+    if tenant is None:
+        raise HTTPException(404, "Tenant not found")
+
+    raw_token = issue_token(
+        db,
+        user_id=user.id,
+        purpose=PURPOSE_REGISTRATION,
+        ttl=timedelta(days=settings.registration_token_ttl_days),
+    )
+    invite_url = f"{settings.post_auth_redirect_url.rstrip('/')}/register?token={raw_token}"
+    background_tasks.add_task(
+        send_registration_invite,
+        to_email=user.email,
+        display_name=user.display_name,
+        tenant_name=tenant.name,
+        role=user.role,
+        invited_by=None,  # service-token call has no acting user context
+        invite_url=invite_url,
+    )
+    log.info("service.invite_resent", user_id=str(user.id))
+    return ResendInviteResponse(status="ok", email=user.email)
+
+
 # ─────────────────────────────────────────────────────────────────────────
 # Tenants + subscriptions
 # ─────────────────────────────────────────────────────────────────────────
@@ -156,6 +309,71 @@ def get_tenant(tenant_id: str, db: Session = Depends(get_db)) -> ServiceTenantOu
     tenant = db.get(Tenant, tid)
     if tenant is None:
         raise HTTPException(404, "Tenant not found")
+    return ServiceTenantOut(
+        id=str(tenant.id),
+        name=tenant.name,
+        segment=tenant.segment,
+        system_context=tenant.system_context,
+    )
+
+
+@router.get("/tenants", response_model=list[ServiceTenantOut])
+def list_tenants(db: Session = Depends(get_db)) -> list[ServiceTenantOut]:
+    """List every tenant. Ordered by name."""
+    rows = db.query(Tenant).order_by(Tenant.name).all()
+    return [
+        ServiceTenantOut(
+            id=str(t.id),
+            name=t.name,
+            segment=t.segment,
+            system_context=t.system_context,
+        )
+        for t in rows
+    ]
+
+
+class CreateTenantRequest(BaseModel):
+    name: str
+    segment: str
+    seed_default_subscription: bool = True
+
+
+VALID_SEGMENTS = {"kibbutz_shitufi", "kibbutz_mitchadesh", "moshav"}
+
+
+@router.post("/tenants", response_model=ServiceTenantOut, status_code=201)
+def create_tenant(
+    payload: CreateTenantRequest,
+    db: Session = Depends(get_db),
+) -> ServiceTenantOut:
+    """Create a new tenant. Auto-seeds a `takanon` subscription unless
+    the caller opts out — that's the default entitlement every tenant
+    starts with today. Meetings entitlements are granted separately once
+    that product goes live."""
+    if payload.segment not in VALID_SEGMENTS:
+        raise HTTPException(400, f"Invalid segment. Allowed: {sorted(VALID_SEGMENTS)}")
+    name = payload.name.strip()
+    if not name:
+        raise HTTPException(400, "name required")
+    if db.query(Tenant).filter(Tenant.name == name).first():
+        raise HTTPException(409, f"Tenant with name {name!r} already exists")
+
+    tenant = Tenant(name=name, segment=payload.segment)
+    db.add(tenant)
+    db.flush()
+
+    if payload.seed_default_subscription:
+        db.add(
+            Subscription(
+                tenant_id=tenant.id,
+                product="takanon",
+                plan="default",
+                active=True,
+            )
+        )
+    db.commit()
+    db.refresh(tenant)
+    log.info("service.tenant_created", tenant_id=str(tenant.id), name=name)
     return ServiceTenantOut(
         id=str(tenant.id),
         name=tenant.name,
