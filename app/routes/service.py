@@ -225,18 +225,25 @@ def update_user(
 def delete_user(user_id: str, db: Session = Depends(get_db)) -> dict:
     """Hard-delete a user. Cascades to auth_tokens via the FK's
     ON DELETE CASCADE. Callers are responsible for guarding against
-    self-deletion — the caller here has no session context."""
+    self-deletion — the caller here has no session context.
+
+    Idempotent: a missing user is treated as "already gone" (200 +
+    `already_absent=True`) rather than 404. This lets product admin
+    panels drift out of sync with identity without exploding on the
+    cleanup path — the more common case in the wild than a genuinely
+    invalid ID."""
     try:
         uid = UUID(user_id)
     except (ValueError, TypeError) as e:
         raise HTTPException(400, "Invalid user_id") from e
     user = db.get(User, uid)
     if user is None:
-        raise HTTPException(404, "User not found")
+        log.info("service.user_delete_missing", user_id=user_id)
+        return {"status": "ok", "already_absent": True}
     db.delete(user)
     db.commit()
     log.info("service.user_deleted", user_id=user_id)
-    return {"status": "ok"}
+    return {"status": "ok", "already_absent": False}
 
 
 class ResendInviteResponse(BaseModel):
