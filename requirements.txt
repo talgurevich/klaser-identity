@@ -1,0 +1,30 @@
+# Web framework
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+
+# Database
+sqlalchemy==2.0.36
+psycopg[binary]==3.2.3
+alembic==1.14.0
+
+# Settings
+pydantic==2.10.3
+pydantic-settings==2.6.1
+
+# HTTP
+httpx==0.28.1
+
+# Auth
+itsdangerous==2.2.0
+google-auth==2.36.0
+bcrypt==4.2.1
+
+# Mail
+resend==2.4.0
+
+# Session middleware
+starlette==0.41.3
+
+# Utilities
+python-dotenv==1.0.1
+structlog==24.4.0
