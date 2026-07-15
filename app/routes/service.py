@@ -313,6 +313,48 @@ def get_tenant(tenant_id: str, db: Session = Depends(get_db)) -> ServiceTenantOu
     )
 
 
+class UpdateTenantSystemContextRequest(BaseModel):
+    """Empty string / whitespace-only is treated as explicit clear
+    (system_context set to NULL). Absent field is not allowed — use
+    None inside the JSON if you mean clear."""
+
+    system_context: str | None
+
+
+@router.patch(
+    "/tenants/{tenant_id}/system-context", response_model=ServiceTenantOut
+)
+def update_tenant_system_context(
+    tenant_id: str,
+    payload: UpdateTenantSystemContextRequest,
+    db: Session = Depends(get_db),
+) -> ServiceTenantOut:
+    """Set the per-tenant system_context used by product answer-paths
+    (currently Takanon's LLM). Identity is the source of truth; product
+    backends read via /api/service/tenants/{id} + a short-lived cache."""
+    try:
+        tid = UUID(tenant_id)
+    except (ValueError, TypeError) as e:
+        raise HTTPException(400, "Invalid tenant_id") from e
+    tenant = db.get(Tenant, tid)
+    if tenant is None:
+        raise HTTPException(404, "Tenant not found")
+    val = (payload.system_context or "").strip()
+    tenant.system_context = val if val else None
+    db.commit()
+    log.info(
+        "service.tenant_context_updated",
+        tenant_id=str(tenant.id),
+        length=len(val),
+    )
+    return ServiceTenantOut(
+        id=str(tenant.id),
+        name=tenant.name,
+        segment=tenant.segment,
+        system_context=tenant.system_context,
+    )
+
+
 @router.get("/tenants", response_model=list[ServiceTenantOut])
 def list_tenants(db: Session = Depends(get_db)) -> list[ServiceTenantOut]:
     """List every tenant. Ordered by name."""
