@@ -52,6 +52,24 @@ class ServiceUserOut(BaseModel):
     role: str
     is_super_admin: bool
     tenant_id: str
+    # True once the user has completed invite-registration or set a password
+    # via reset. Google-only users stay False; drives the "resend invite"
+    # affordance in product admin panels.
+    has_password: bool = False
+    created_at: datetime | None = None
+
+
+def _user_to_out(u: User) -> ServiceUserOut:
+    return ServiceUserOut(
+        id=str(u.id),
+        email=u.email,
+        display_name=u.display_name,
+        role=u.role,
+        is_super_admin=u.is_super_admin,
+        tenant_id=str(u.tenant_id),
+        has_password=u.password_hash is not None,
+        created_at=u.created_at,
+    )
 
 
 class InviteUserRequest(BaseModel):
@@ -60,6 +78,7 @@ class InviteUserRequest(BaseModel):
     role: str  # admin | reviewer | secretary
     display_name: str | None = None
     invited_by: str | None = None  # display name of the inviter, purely for the email
+    is_super_admin: bool = False  # promoted at invite time; skips a follow-up PATCH
 
 
 @router.post("/users", response_model=ServiceUserOut, status_code=201)
@@ -88,6 +107,7 @@ def invite_user(
         email=email,
         tenant_id=tenant_uuid,
         role=payload.role,
+        is_super_admin=payload.is_super_admin,
         display_name=(payload.display_name or "").strip() or None,
     )
     db.add(user)
@@ -112,14 +132,7 @@ def invite_user(
     )
 
     log.info("service.user_invited", user_id=str(user.id), tenant_id=str(tenant_uuid))
-    return ServiceUserOut(
-        id=str(user.id),
-        email=user.email,
-        display_name=user.display_name,
-        role=user.role,
-        is_super_admin=user.is_super_admin,
-        tenant_id=str(user.tenant_id),
-    )
+    return _user_to_out(user)
 
 
 @router.get("/users/{user_id}", response_model=ServiceUserOut)
@@ -131,14 +144,7 @@ def get_user(user_id: str, db: Session = Depends(get_db)) -> ServiceUserOut:
     user = db.get(User, uid)
     if user is None:
         raise HTTPException(404, "User not found")
-    return ServiceUserOut(
-        id=str(user.id),
-        email=user.email,
-        display_name=user.display_name,
-        role=user.role,
-        is_super_admin=user.is_super_admin,
-        tenant_id=str(user.tenant_id),
-    )
+    return _user_to_out(user)
 
 
 @router.get("/users", response_model=list[ServiceUserOut])
@@ -156,17 +162,7 @@ def list_users(
             raise HTTPException(400, "Invalid tenant_id") from e
         q = q.filter(User.tenant_id == tid)
     rows = q.order_by(User.email).all()
-    return [
-        ServiceUserOut(
-            id=str(u.id),
-            email=u.email,
-            display_name=u.display_name,
-            role=u.role,
-            is_super_admin=u.is_super_admin,
-            tenant_id=str(u.tenant_id),
-        )
-        for u in rows
-    ]
+    return [_user_to_out(u) for u in rows]
 
 
 class UpdateUserRequest(BaseModel):
@@ -211,14 +207,7 @@ def update_user(
     db.commit()
     db.refresh(user)
     log.info("service.user_updated", user_id=str(user.id))
-    return ServiceUserOut(
-        id=str(user.id),
-        email=user.email,
-        display_name=user.display_name,
-        role=user.role,
-        is_super_admin=user.is_super_admin,
-        tenant_id=str(user.tenant_id),
-    )
+    return _user_to_out(user)
 
 
 @router.delete("/users/{user_id}")
