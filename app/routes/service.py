@@ -18,6 +18,9 @@ What's here:
   - `GET  /api/service/tenants` — list.
   - `GET  /api/service/tenants/{id}` — lookup.
   - `GET  /api/service/tenants/{id}/subscriptions` — list entitlements.
+  - `POST /api/service/tenants/{id}/subscriptions` — grant entitlement
+    (idempotent: reactivates an existing row if one exists).
+  - `DELETE /api/service/subscriptions/{id}` — revoke (hard-delete).
 """
 from __future__ import annotations
 
@@ -456,3 +459,100 @@ def list_tenant_subscriptions(
         )
         for r in rows
     ]
+
+
+# Product IDs identity knows about. Kept small on purpose — adding a new
+# product to the platform is a deliberate act, not something an admin
+# should be able to typo into existence from a UI.
+VALID_PRODUCTS = {"takanon", "meetings"}
+
+
+class GrantSubscriptionRequest(BaseModel):
+    product: str
+    plan: str = "default"
+    expires_at: datetime | None = None
+
+
+@router.post(
+    "/tenants/{tenant_id}/subscriptions",
+    response_model=SubscriptionOut,
+    status_code=201,
+)
+def grant_subscription(
+    tenant_id: str,
+    payload: GrantSubscriptionRequest,
+    db: Session = Depends(get_db),
+) -> SubscriptionOut:
+    """Grant a product entitlement to a tenant. Idempotent: if a row for
+    (tenant, product) already exists, reactivate it and update plan/expiry
+    rather than inserting a duplicate."""
+    try:
+        tid = UUID(tenant_id)
+    except (ValueError, TypeError) as e:
+        raise HTTPException(400, "Invalid tenant_id") from e
+    if db.get(Tenant, tid) is None:
+        raise HTTPException(404, "Tenant not found")
+    product = payload.product.strip().lower()
+    if product not in VALID_PRODUCTS:
+        raise HTTPException(
+            400, f"Unknown product {product!r}. Allowed: {sorted(VALID_PRODUCTS)}"
+        )
+
+    existing = (
+        db.query(Subscription)
+        .filter(Subscription.tenant_id == tid, Subscription.product == product)
+        .one_or_none()
+    )
+    if existing is not None:
+        existing.active = True
+        existing.plan = payload.plan
+        existing.expires_at = payload.expires_at
+        sub = existing
+    else:
+        sub = Subscription(
+            tenant_id=tid,
+            product=product,
+            plan=payload.plan,
+            active=True,
+            expires_at=payload.expires_at,
+        )
+        db.add(sub)
+    db.commit()
+    db.refresh(sub)
+    log.info(
+        "service.subscription_granted",
+        tenant_id=str(tid),
+        product=product,
+        reactivated=existing is not None,
+    )
+    return SubscriptionOut(
+        id=str(sub.id),
+        product=sub.product,
+        plan=sub.plan,
+        active=sub.active,
+        expires_at=sub.expires_at,
+        created_at=sub.created_at,
+    )
+
+
+@router.delete("/subscriptions/{subscription_id}", status_code=204)
+def revoke_subscription(subscription_id: str, db: Session = Depends(get_db)) -> None:
+    """Hard-delete a subscription row. Product access stops on the next
+    request (identity is not cached at the entitlement level)."""
+    try:
+        sid = UUID(subscription_id)
+    except (ValueError, TypeError) as e:
+        raise HTTPException(400, "Invalid subscription_id") from e
+    sub = db.get(Subscription, sid)
+    if sub is None:
+        raise HTTPException(404, "Subscription not found")
+    tenant_id = str(sub.tenant_id)
+    product = sub.product
+    db.delete(sub)
+    db.commit()
+    log.info(
+        "service.subscription_revoked",
+        subscription_id=subscription_id,
+        tenant_id=tenant_id,
+        product=product,
+    )
