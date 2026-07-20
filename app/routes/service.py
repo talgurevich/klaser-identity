@@ -535,8 +535,10 @@ def grant_subscription(
     )
 
 
-@router.delete("/subscriptions/{subscription_id}", status_code=204)
-def revoke_subscription(subscription_id: str, db: Session = Depends(get_db)) -> None:
+@router.delete("/subscriptions/{subscription_id}")
+def revoke_subscription(
+    subscription_id: str, db: Session = Depends(get_db)
+) -> dict[str, str]:
     """Hard-delete a subscription row. Product access stops on the next
     request (identity is not cached at the entitlement level)."""
     try:
@@ -556,3 +558,4 @@ def revoke_subscription(subscription_id: str, db: Session = Depends(get_db)) -> 
         tenant_id=tenant_id,
         product=product,
     )
+    return {"status": "revoked"}
